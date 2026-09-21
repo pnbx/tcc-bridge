@@ -133,8 +133,7 @@ public final class TccBridge extends JavaPlugin {
             MemoryUsage heap = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
             body.put("memoryUsedMb", round2(heap.getUsed() / 1048576.0));
             body.put("memoryMaxMb", round2(heap.getMax() / 1048576.0));
-            File root = fs.root().toFile();
-            body.put("diskUsedGb", round2((root.getTotalSpace() - root.getUsableSpace()) / 1073741824.0));
+            body.put("diskUsedGb", diskUsedGb());
             body.put("uptimeSec", (System.currentTimeMillis() - startedAt) / 1000);
             body.put("source", "plugin");
 
@@ -151,6 +150,32 @@ public final class TccBridge extends JavaPlugin {
         } finally {
             pushInFlight.set(false);
         }
+    }
+
+
+    private volatile double cachedDiskGb = -1;
+    private volatile long cachedDiskAt = 0;
+
+    /** Bytes actually used by this server's own directory (10-minute cache). */
+    private double diskUsedGb() {
+        long now = System.currentTimeMillis();
+        if (cachedDiskGb >= 0 && now - cachedDiskAt < 600_000) return cachedDiskGb;
+        long total = 0;
+        int visited = 0;
+        try (var walk = java.nio.file.Files.walk(fs.root())) {
+            for (var it = walk.iterator(); it.hasNext() && visited < 300000; ) {
+                var path = it.next();
+                visited++;
+                try {
+                    if (java.nio.file.Files.isRegularFile(path)) total += java.nio.file.Files.size(path);
+                } catch (Exception ignored) {
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        cachedDiskGb = round2(total / 1073741824.0);
+        cachedDiskAt = now;
+        return cachedDiskGb;
     }
 
     // ── console feed ─────────────────────────────────────────────────────────
