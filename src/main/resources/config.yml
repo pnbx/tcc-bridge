@@ -1,0 +1,9 @@
+# TccBridge — connection to site.tccmc.ir
+#
+# site-url  : where the website lives (no trailing slash)
+# token     : the shared secret; must equal MC_INGEST_TOKEN in the website's .env
+# intervals : how often the server reports status and checks for queued commands
+site-url: "https://site.tccmc.ir"
+token: ""
+push-interval-seconds: 20
+poll-interval-seconds: 10

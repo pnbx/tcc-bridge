@@ -1,0 +1,12 @@
+name: TccBridge
+version: '1.0.0'
+main: ir.tcc.bridge.TccBridge
+api-version: '1.21'
+authors: [TCC]
+description: Bridges the TCC game server with site.tccmc.ir — live status push, rank/command queue and in-game account linking.
+website: https://site.tccmc.ir
+commands:
+  site:
+    description: Connect your Minecraft account to the TCC website
+    usage: /site connect <code>
+    aliases: [tccweb]
