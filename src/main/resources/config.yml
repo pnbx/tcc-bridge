@@ -9,3 +9,6 @@ push-interval-seconds: 20
 poll-interval-seconds: 10
 console-push-seconds: 5
 tier-push-seconds: 60
+# how often cumulative player statistics are pushed (seconds) and for how many players
+stats-push-seconds: 900
+stats-players: 120

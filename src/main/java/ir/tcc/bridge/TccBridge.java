@@ -46,20 +46,24 @@ public final class TccBridge extends JavaPlugin {
     private int pollSeconds;
     private int logSeconds;
     private int tierSeconds;
+    private int statsSeconds;
 
     private BukkitTask pushTask;
     private BukkitTask pollTask;
     private BukkitTask logTask;
     private BukkitTask tierTask;
+    private BukkitTask statsTask;
 
     private final AtomicBoolean pushInFlight = new AtomicBoolean(false);
     private final AtomicBoolean pollInFlight = new AtomicBoolean(false);
     private final AtomicBoolean logInFlight = new AtomicBoolean(false);
     private final AtomicBoolean tierInFlight = new AtomicBoolean(false);
+    private final AtomicBoolean statsInFlight = new AtomicBoolean(false);
 
     private Fs fs;
     private LogTailer tailer;
     private TierReader tierReader;
+    private StatsReader statsReader;
     private final long startedAt = System.currentTimeMillis();
 
     private volatile long lastPushAt = 0L;
@@ -84,6 +88,7 @@ public final class TccBridge extends JavaPlugin {
         fs = new Fs(root);
         tailer = new LogTailer(root);
         tierReader = new TierReader(root.toPath());
+        statsReader = new StatsReader(root.toPath());
 
         if (token.isEmpty()) {
             getLogger().warning("token is empty — put the website's MC_INGEST_TOKEN in plugins/TccBridge/config.yml, then /site reload");
@@ -107,6 +112,7 @@ public final class TccBridge extends JavaPlugin {
         pollSeconds = Math.max(5, getConfig().getInt("poll-interval-seconds", 10));
         logSeconds = Math.max(3, getConfig().getInt("console-push-seconds", 5));
         tierSeconds = Math.max(20, getConfig().getInt("tier-push-seconds", 60));
+        statsSeconds = Math.max(120, getConfig().getInt("stats-push-seconds", 900));
     }
 
     private void startTasks() {
@@ -115,6 +121,7 @@ public final class TccBridge extends JavaPlugin {
         pollTask = Bukkit.getScheduler().runTaskTimerAsynchronously(this, this::pollWork, 120L, pollSeconds * 20L);
         logTask = Bukkit.getScheduler().runTaskTimerAsynchronously(this, this::pushConsole, 100L, logSeconds * 20L);
         tierTask = Bukkit.getScheduler().runTaskTimerAsynchronously(this, this::pushTiers, 200L, tierSeconds * 20L);
+        statsTask = Bukkit.getScheduler().runTaskTimerAsynchronously(this, this::pushStats, 600L, statsSeconds * 20L);
     }
 
     private void stopTasks() {
@@ -122,6 +129,7 @@ public final class TccBridge extends JavaPlugin {
         if (pollTask != null) pollTask.cancel();
         if (logTask != null) logTask.cancel();
         if (tierTask != null) tierTask.cancel();
+        if (statsTask != null) statsTask.cancel();
     }
 
     // ── status push ──────────────────────────────────────────────────────────
@@ -215,6 +223,32 @@ public final class TccBridge extends JavaPlugin {
             tierInFlight.set(false);
         }
     }
+    /**
+     * Pushes cumulative player statistics read through PlaceholderAPI (the
+     * Statistics expansion reads each player's own stats file, so the numbers
+     * cover everything they have done on this server).
+     */
+    private void pushStats() {
+        if (token.isEmpty() || !statsInFlight.compareAndSet(false, true)) return;
+        try {
+            if (!statsReader.available()) return; // PlaceholderAPI not installed
+            int limit = Math.max(10, getConfig().getInt("stats-players", 120));
+            Map<String, Object> payload = statsReader.readAll(limit);
+            List<?> players = (List<?>) payload.get("players");
+            if (players == null || players.isEmpty()) return;
+            Response res = post("/api/mc/stats", Json.write(payload));
+            if (res.status == 200) {
+                lastPushResult = "موفق";
+                getLogger().info("pushed stats for " + players.size() + " players");
+            } else {
+                getLogger().warning("stats push failed: HTTP " + res.status + " " + trim(res.body));
+            }
+        } catch (Exception e) {
+            getLogger().warning("stats push error: " + e.getMessage());
+        } finally {
+            statsInFlight.set(false);
+        }
+    }
     // ── work queue ───────────────────────────────────────────────────────────
 
     private void pollWork() {
@@ -278,6 +312,8 @@ public final class TccBridge extends JavaPlugin {
                     fs.rename(Json.string(payload.get("from")), Json.string(payload.get("to")));
                     return Map.of("ok", true);
                 });
+            case "stats.read":
+                return jobResult(id, () -> statsReader.readAll(Math.max(10, getConfig().getInt("stats-players", 120))));
             case "tiers.read":
                 return jobResult(id, () -> tierReader.readAll());
             case "file.search":
