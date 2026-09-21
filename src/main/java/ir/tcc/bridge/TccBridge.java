@@ -45,17 +45,21 @@ public final class TccBridge extends JavaPlugin {
     private int pushSeconds;
     private int pollSeconds;
     private int logSeconds;
+    private int tierSeconds;
 
     private BukkitTask pushTask;
     private BukkitTask pollTask;
     private BukkitTask logTask;
+    private BukkitTask tierTask;
 
     private final AtomicBoolean pushInFlight = new AtomicBoolean(false);
     private final AtomicBoolean pollInFlight = new AtomicBoolean(false);
     private final AtomicBoolean logInFlight = new AtomicBoolean(false);
+    private final AtomicBoolean tierInFlight = new AtomicBoolean(false);
 
     private Fs fs;
     private LogTailer tailer;
+    private TierReader tierReader;
     private final long startedAt = System.currentTimeMillis();
 
     private volatile long lastPushAt = 0L;
@@ -79,6 +83,7 @@ public final class TccBridge extends JavaPlugin {
         File root = serverRoot == null ? new File(".") : serverRoot;
         fs = new Fs(root);
         tailer = new LogTailer(root);
+        tierReader = new TierReader(root);
 
         if (token.isEmpty()) {
             getLogger().warning("token is empty — put the website's MC_INGEST_TOKEN in plugins/TccBridge/config.yml, then /site reload");
@@ -101,6 +106,7 @@ public final class TccBridge extends JavaPlugin {
         pushSeconds = Math.max(5, getConfig().getInt("push-interval-seconds", 20));
         pollSeconds = Math.max(5, getConfig().getInt("poll-interval-seconds", 10));
         logSeconds = Math.max(3, getConfig().getInt("console-push-seconds", 5));
+        tierSeconds = Math.max(20, getConfig().getInt("tier-push-seconds", 60));
     }
 
     private void startTasks() {
@@ -108,12 +114,14 @@ public final class TccBridge extends JavaPlugin {
         pushTask = Bukkit.getScheduler().runTaskTimerAsynchronously(this, this::pushStatus, 60L, pushSeconds * 20L);
         pollTask = Bukkit.getScheduler().runTaskTimerAsynchronously(this, this::pollWork, 120L, pollSeconds * 20L);
         logTask = Bukkit.getScheduler().runTaskTimerAsynchronously(this, this::pushConsole, 100L, logSeconds * 20L);
+        tierTask = Bukkit.getScheduler().runTaskTimerAsynchronously(this, this::pushTiers, 200L, tierSeconds * 20L);
     }
 
     private void stopTasks() {
         if (pushTask != null) pushTask.cancel();
         if (pollTask != null) pollTask.cancel();
         if (logTask != null) logTask.cancel();
+        if (tierTask != null) tierTask.cancel();
     }
 
     // ── status push ──────────────────────────────────────────────────────────
@@ -193,6 +201,20 @@ public final class TccBridge extends JavaPlugin {
         }
     }
 
+    /** Mirrors the in-game tier system to the site (Skript variables are the source). */
+    private void pushTiers() {
+        if (token.isEmpty() || !tierInFlight.compareAndSet(false, true)) return;
+        try {
+            Map<String, Object> payload = tierReader.readAll();
+            List<?> tiers = (List<?>) payload.get("tiers");
+            if (tiers == null || tiers.isEmpty()) return; // nothing assigned yet
+            post("/api/mc/tiers", Json.write(payload));
+        } catch (Exception e) {
+            getLogger().warning("tier sync error: " + e.getMessage());
+        } finally {
+            tierInFlight.set(false);
+        }
+    }
     // ── work queue ───────────────────────────────────────────────────────────
 
     private void pollWork() {
@@ -256,6 +278,8 @@ public final class TccBridge extends JavaPlugin {
                     fs.rename(Json.string(payload.get("from")), Json.string(payload.get("to")));
                     return Map.of("ok", true);
                 });
+            case "tiers.read":
+                return jobResult(id, () -> tierReader.readAll());
             case "file.search":
                 return jobResult(id, () -> fs.search(Json.string(payload.get("dir")), Json.string(payload.get("pattern"))));
             case "power.restart":
