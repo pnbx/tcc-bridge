@@ -83,7 +83,7 @@ public final class TccBridge extends JavaPlugin {
         File root = serverRoot == null ? new File(".") : serverRoot;
         fs = new Fs(root);
         tailer = new LogTailer(root);
-        tierReader = new TierReader(root);
+        tierReader = new TierReader(root.toPath());
 
         if (token.isEmpty()) {
             getLogger().warning("token is empty — put the website's MC_INGEST_TOKEN in plugins/TccBridge/config.yml, then /site reload");
