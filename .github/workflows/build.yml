@@ -29,3 +29,14 @@ jobs:
           name: TccBridge
           path: build/libs/*.jar
           if-no-files-found: error
+
+      # Action artifacts live on Azure blob storage, which is unreachable from
+      # the deployment network; a release asset is downloadable everywhere.
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          jar=$(ls build/libs/*.jar | head -1)
+          gh release create "build-${{ github.run_number }}" "$jar" \
+            --title "TccBridge build ${{ github.run_number }}" \
+            --notes "Automated build from ${{ github.sha }}"
