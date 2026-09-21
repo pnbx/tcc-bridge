@@ -1,5 +1,6 @@
 package ir.tcc.bridge;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
@@ -25,8 +26,8 @@ final class LogTailer {
     private final Path logFile;
     private long offset = 0;
 
-    LogTailer(Path serverRoot) {
-        this.logFile = serverRoot.resolve("logs").resolve("latest.log");
+    LogTailer(File serverRoot) {
+        this.logFile = serverRoot.toPath().resolve("logs").resolve("latest.log");
     }
 
     List<Map<String, Object>> poll(int maxLines) {

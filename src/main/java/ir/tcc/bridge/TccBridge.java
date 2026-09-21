@@ -271,6 +271,7 @@ public final class TccBridge extends JavaPlugin {
         }
     }
 
+    @SuppressWarnings("deprecation") // Server.Spigot#restart is deprecated but is the only in-process restart
     private Map<String, Object> powerAction(String id, String action, boolean force) {
         // ack first: the JVM is about to go away
         ack(List.of(simpleResult(id, true, action + " requested")));
