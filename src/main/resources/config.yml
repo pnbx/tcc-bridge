@@ -7,3 +7,4 @@ site-url: "https://site.tccmc.ir"
 token: ""
 push-interval-seconds: 20
 poll-interval-seconds: 10
+console-push-seconds: 5

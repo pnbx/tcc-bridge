@@ -8,6 +8,9 @@ import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
 
+import java.io.File;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryUsage;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -23,13 +26,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * TccBridge — the game server's half of the website integration.
  *
  * The site and the game host cannot always reach each other (the Iranian game
- * host drops foreign traffic), so this plugin drives the connection outward:
+ * host drops foreign traffic), so this plugin drives the connection outward and
+ * doubles as the agent for everything the hosting panel used to provide:
  *
- *   push  : real status (players, MOTD, version, TPS, MSPT) every N seconds
- *   poll  : collect queued console commands (store rank grants) and run them
- *   link  : /site connect &lt;code&gt; proves account ownership in game
+ *   push    → live status (players, MOTD, version, TPS, MSPT, RAM, disk)
+ *   logs    → console lines tailed from logs/latest.log
+ *   poll    → queued work: console commands (rank grants), file operations, power
+ *   link    → /site connect &lt;code&gt; proves account ownership in game
  *
- * Endpoints used: POST /api/mc/ingest, /api/mc/poll, /api/mc/ack and
+ * Endpoints: /api/mc/ingest, /api/mc/logs, /api/mc/poll, /api/mc/ack and
  * /api/account/link/confirm — all authenticated with the shared token header.
  */
 public final class TccBridge extends JavaPlugin {
@@ -39,23 +44,27 @@ public final class TccBridge extends JavaPlugin {
     private String token;
     private int pushSeconds;
     private int pollSeconds;
+    private int logSeconds;
+
     private BukkitTask pushTask;
     private BukkitTask pollTask;
+    private BukkitTask logTask;
 
     private final AtomicBoolean pushInFlight = new AtomicBoolean(false);
     private final AtomicBoolean pollInFlight = new AtomicBoolean(false);
+    private final AtomicBoolean logInFlight = new AtomicBoolean(false);
 
-    /** Last successful push, surfaced through /site status. */
+    private Fs fs;
+    private LogTailer tailer;
+    private final long startedAt = System.currentTimeMillis();
+
     private volatile long lastPushAt = 0L;
     private volatile String lastPushResult = "هرگز";
 
     @Override
     public void onEnable() {
         saveDefaultConfig();
-        siteUrl = getConfig().getString("site-url", "https://site.tccmc.ir").replaceAll("/+$", "");
-        token = getConfig().getString("token", "").trim();
-        pushSeconds = Math.max(5, getConfig().getInt("push-interval-seconds", 20));
-        pollSeconds = Math.max(5, getConfig().getInt("poll-interval-seconds", 10));
+        loadSettings();
 
         http = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
@@ -63,12 +72,21 @@ public final class TccBridge extends JavaPlugin {
                 .followRedirects(HttpClient.Redirect.NORMAL)
                 .build();
 
+        // the plugin lives in <server>/plugins/TccBridge, so the server root is two levels up
+        File serverRoot = getDataFolder().getParentFile() == null
+                ? new File(".")
+                : getDataFolder().getParentFile().getParentFile();
+        File root = serverRoot == null ? new File(".") : serverRoot;
+        fs = new Fs(root);
+        tailer = new LogTailer(root);
+
         if (token.isEmpty()) {
             getLogger().warning("token is empty — put the website's MC_INGEST_TOKEN in plugins/TccBridge/config.yml, then /site reload");
         }
 
         startTasks();
-        getLogger().info("TccBridge enabled → " + siteUrl + " (push " + pushSeconds + "s, poll " + pollSeconds + "s)");
+        getLogger().info("TccBridge enabled → " + siteUrl
+                + " (status " + pushSeconds + "s, work " + pollSeconds + "s, console " + logSeconds + "s, root " + root.getAbsolutePath() + ")");
     }
 
     @Override
@@ -77,16 +95,25 @@ public final class TccBridge extends JavaPlugin {
         getLogger().info("TccBridge disabled.");
     }
 
+    private void loadSettings() {
+        siteUrl = getConfig().getString("site-url", "https://site.tccmc.ir").replaceAll("/+$", "");
+        token = getConfig().getString("token", "").trim();
+        pushSeconds = Math.max(5, getConfig().getInt("push-interval-seconds", 20));
+        pollSeconds = Math.max(5, getConfig().getInt("poll-interval-seconds", 10));
+        logSeconds = Math.max(3, getConfig().getInt("console-push-seconds", 5));
+    }
+
     private void startTasks() {
         stopTasks();
-        // small initial delay so a restart does not race the server startup
         pushTask = Bukkit.getScheduler().runTaskTimerAsynchronously(this, this::pushStatus, 60L, pushSeconds * 20L);
-        pollTask = Bukkit.getScheduler().runTaskTimerAsynchronously(this, this::pollCommands, 120L, pollSeconds * 20L);
+        pollTask = Bukkit.getScheduler().runTaskTimerAsynchronously(this, this::pollWork, 120L, pollSeconds * 20L);
+        logTask = Bukkit.getScheduler().runTaskTimerAsynchronously(this, this::pushConsole, 100L, logSeconds * 20L);
     }
 
     private void stopTasks() {
         if (pushTask != null) pushTask.cancel();
         if (pollTask != null) pollTask.cancel();
+        if (logTask != null) logTask.cancel();
     }
 
     // ── status push ──────────────────────────────────────────────────────────
@@ -98,10 +125,17 @@ public final class TccBridge extends JavaPlugin {
             body.put("playersOnline", Bukkit.getOnlinePlayers().size());
             body.put("playersMax", Bukkit.getMaxPlayers());
             body.put("version", Bukkit.getMinecraftVersion());
-            body.put("motd", List.of(ChatColor.stripColor(Bukkit.getMotd() == null ? "TCC Network" : Bukkit.getMotd())));
+            body.put("motd", List.of(ChatColor.stripColor(Bukkit.getMotd() == null ? "" : Bukkit.getMotd())));
             double[] tps = Bukkit.getServer().getTPS();
             if (tps.length > 0) body.put("tps", round2(tps[0]));
             body.put("mspt", round2(Bukkit.getServer().getAverageTickTime()));
+
+            MemoryUsage heap = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
+            body.put("memoryUsedMb", round2(heap.getUsed() / 1048576.0));
+            body.put("memoryMaxMb", round2(heap.getMax() / 1048576.0));
+            File root = fs.root().toFile();
+            body.put("diskUsedGb", round2((root.getTotalSpace() - root.getUsableSpace()) / 1073741824.0));
+            body.put("uptimeSec", (System.currentTimeMillis() - startedAt) / 1000);
             body.put("source", "plugin");
 
             Response res = post("/api/mc/ingest", Json.write(body));
@@ -109,20 +143,34 @@ public final class TccBridge extends JavaPlugin {
                 lastPushAt = System.currentTimeMillis();
                 lastPushResult = "موفق";
             } else {
-                lastPushResult = "خطای " + res.status + (res.body.isEmpty() ? "" : " — " + trim(res.body));
+                lastPushResult = "خطای " + res.status;
                 getLogger().warning("status push failed: HTTP " + res.status + " " + trim(res.body));
             }
         } catch (Exception e) {
             lastPushResult = "خطا — " + e.getClass().getSimpleName();
-            getLogger().warning("status push error: " + e.getMessage());
         } finally {
             pushInFlight.set(false);
         }
     }
 
-    // ── command queue pull ───────────────────────────────────────────────────
+    // ── console feed ─────────────────────────────────────────────────────────
 
-    private void pollCommands() {
+    private void pushConsole() {
+        if (token.isEmpty() || !logInFlight.compareAndSet(false, true)) return;
+        try {
+            List<Map<String, Object>> lines = tailer.poll(200);
+            if (lines.isEmpty()) return;
+            post("/api/mc/logs", Json.write(Map.of("lines", lines)));
+        } catch (Exception e) {
+            getLogger().warning("console push error: " + e.getMessage());
+        } finally {
+            logInFlight.set(false);
+        }
+    }
+
+    // ── work queue ───────────────────────────────────────────────────────────
+
+    private void pollWork() {
         if (token.isEmpty() || !pollInFlight.compareAndSet(false, true)) return;
         try {
             Response res = post("/api/mc/poll", "{}");
@@ -131,24 +179,18 @@ public final class TccBridge extends JavaPlugin {
                 return;
             }
             Map<String, Object> root = Json.object(Json.read(res.body));
-            List<Object> commands = Json.array(Json.object(root.get("data")).get("commands"));
-            if (commands.isEmpty()) return;
+            List<Object> jobs = Json.array(Json.object(root.get("data")).get("commands"));
+            if (jobs.isEmpty()) return;
 
             List<Map<String, Object>> results = new ArrayList<>();
-            for (Object raw : commands) {
-                Map<String, Object> entry = Json.object(raw);
-                String id = Json.string(entry.get("id"));
-                String command = Json.string(entry.get("command"));
-                if (id == null || command == null) continue;
-                if (Bukkit.isPrimaryThread()) {
-                    results.add(runCommand(id, command));
-                } else {
-                    // The Bukkit API must be touched from the main thread.
-                    Bukkit.getScheduler().runTask(this, () -> {
-                        Map<String, Object> r = runCommand(id, command);
-                        Bukkit.getScheduler().runTaskAsynchronously(this, () -> ack(List.of(r)));
-                    });
-                }
+            for (Object raw : jobs) {
+                Map<String, Object> job = Json.object(raw);
+                String id = Json.string(job.get("id"));
+                String kind = Json.string(job.get("kind"));
+                if (id == null) continue;
+                if (kind == null || kind.isEmpty()) kind = "command";
+                Map<String, Object> result = handleJob(id, kind, job);
+                if (result != null) results.add(result); // power acks itself before acting
             }
             if (!results.isEmpty()) ack(results);
         } catch (Exception e) {
@@ -158,20 +200,97 @@ public final class TccBridge extends JavaPlugin {
         }
     }
 
-    private Map<String, Object> runCommand(String id, String command) {
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("id", id);
-        try {
-            boolean ok = Bukkit.dispatchCommand(Bukkit.getConsoleSender(), command);
-            result.put("ok", ok);
-            result.put("result", ok ? "executed" : "dispatch returned false");
-            getLogger().info("ran queued command: /" + command + (ok ? "" : " (returned false)"));
-        } catch (Exception e) {
-            result.put("ok", false);
-            result.put("result", e.getClass().getSimpleName() + ": " + e.getMessage());
-            getLogger().warning("queued command failed: /" + command + " → " + e.getMessage());
+    private Map<String, Object> handleJob(String id, String kind, Map<String, Object> job) {
+        Object payloadRaw = job.get("payload");
+        Map<String, Object> payload = payloadRaw == null ? Map.of() : Json.object(payloadRaw);
+
+        switch (kind) {
+            case "command":
+                return runConsoleCommand(id, Json.string(job.get("command")));
+            case "file.list":
+                return jobResult(id, () -> fs.list(Json.string(payload.get("dir"))));
+            case "file.read":
+                return jobResult(id, () -> fs.read(Json.string(payload.get("path")), intOf(payload.get("limitBytes"), 512 * 1024)));
+            case "file.write":
+                return jobResult(id, () -> {
+                    fs.write(Json.string(payload.get("path")), Json.string(payload.get("content")), boolOf(payload.get("exclusive")));
+                    return Map.of("ok", true);
+                });
+            case "file.delete":
+                return jobResult(id, () -> {
+                    fs.delete(Json.string(payload.get("path")));
+                    return Map.of("ok", true);
+                });
+            case "file.mkdir":
+                return jobResult(id, () -> {
+                    fs.mkdir(Json.string(payload.get("path")));
+                    return Map.of("ok", true);
+                });
+            case "file.rename":
+                return jobResult(id, () -> {
+                    fs.rename(Json.string(payload.get("from")), Json.string(payload.get("to")));
+                    return Map.of("ok", true);
+                });
+            case "file.search":
+                return jobResult(id, () -> fs.search(Json.string(payload.get("dir")), Json.string(payload.get("pattern"))));
+            case "power.restart":
+                return powerAction(id, "restart", boolOf(payload.get("force")));
+            case "power.stop":
+                return powerAction(id, "stop", boolOf(payload.get("force")));
+            default:
+                return simpleResult(id, false, "unknown job kind: " + kind);
         }
-        return result;
+    }
+
+    private interface JobBody {
+        Object run() throws Exception;
+    }
+
+    private Map<String, Object> jobResult(String id, JobBody body) {
+        try {
+            Object value = body.run();
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("id", id);
+            result.put("ok", true);
+            result.put("result", Json.write(value));
+            return result;
+        } catch (Exception e) {
+            getLogger().warning("job failed: " + e.getMessage());
+            return simpleResult(id, false, e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+    }
+
+    private Map<String, Object> runConsoleCommand(String id, String command) {
+        if (command == null || command.isBlank()) return simpleResult(id, false, "empty command");
+        try {
+            Boolean ok = Bukkit.getScheduler().callSyncMethod(this, () -> Bukkit.dispatchCommand(Bukkit.getConsoleSender(), command)).get();
+            getLogger().info("ran queued command: /" + command);
+            return simpleResult(id, ok == null || ok, ok == null || ok ? "executed" : "dispatch returned false");
+        } catch (Exception e) {
+            return simpleResult(id, false, e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+    }
+
+    private Map<String, Object> powerAction(String id, String action, boolean force) {
+        // ack first: the JVM is about to go away
+        ack(List.of(simpleResult(id, true, action + " requested")));
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if ("stop".equals(action)) {
+                Bukkit.shutdown();
+            } else {
+                // Paper implements Spigot's restart (re-runs server.jar in place)
+                Bukkit.getServer().spigot().restart();
+            }
+        }, 20L);
+        return null;
+    }
+
+    private Map<String, Object> simpleResult(String id, boolean ok, String message) {
+        Map<String, Object> r = new LinkedHashMap<>();
+        r.put("id", id);
+        r.put("ok", ok);
+        r.put("result", message);
+        return r;
     }
 
     private void ack(List<Map<String, Object>> results) {
@@ -211,6 +330,7 @@ public final class TccBridge extends JavaPlugin {
                 sender.sendMessage(ChatColor.AQUA + "TccBridge" + ChatColor.GRAY + " → " + ChatColor.WHITE + siteUrl);
                 sender.sendMessage(ChatColor.GRAY + "توکن: " + (token.isEmpty() ? ChatColor.RED + "تنظیم نشده" : ChatColor.GREEN + "تنظیم شده"));
                 sender.sendMessage(ChatColor.GRAY + "آخرین ارسال وضعیت: " + ChatColor.WHITE + when + ChatColor.GRAY + " (" + lastPushResult + ")");
+                sender.sendMessage(ChatColor.GRAY + "ریشه فایل‌ها: " + ChatColor.WHITE + fs.root());
                 return true;
             }
             case "reload" -> {
@@ -219,10 +339,7 @@ public final class TccBridge extends JavaPlugin {
                     return true;
                 }
                 reloadConfig();
-                siteUrl = getConfig().getString("site-url", "https://site.tccmc.ir").replaceAll("/+$", "");
-                token = getConfig().getString("token", "").trim();
-                pushSeconds = Math.max(5, getConfig().getInt("push-interval-seconds", 20));
-                pollSeconds = Math.max(5, getConfig().getInt("poll-interval-seconds", 10));
+                loadSettings();
                 startTasks();
                 sender.sendMessage(ChatColor.GREEN + "TccBridge reloaded.");
                 return true;
@@ -262,13 +379,13 @@ public final class TccBridge extends JavaPlugin {
         });
     }
 
-    // ── http ─────────────────────────────────────────────────────────────────
+    // ── http helpers ─────────────────────────────────────────────────────────
 
     private record Response(int status, String body) {}
 
     private Response post(String path, String jsonBody) throws Exception {
         HttpRequest request = HttpRequest.newBuilder(URI.create(siteUrl + path))
-                .timeout(Duration.ofSeconds(15))
+                .timeout(Duration.ofSeconds(20))
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json")
                 .header("X-TCC-Token", token)
@@ -280,6 +397,14 @@ public final class TccBridge extends JavaPlugin {
 
     private static double round2(double value) {
         return Math.round(value * 100.0) / 100.0;
+    }
+
+    private static int intOf(Object value, int fallback) {
+        return value instanceof Number n ? n.intValue() : fallback;
+    }
+
+    private static boolean boolOf(Object value) {
+        return value instanceof Boolean b ? b : value != null && Boolean.parseBoolean(String.valueOf(value));
     }
 
     private static String trim(String s) {
