@@ -88,7 +88,7 @@ final class StatsReader {
 
     private String resolve(OfflinePlayer player, String placeholder) {
         try {
-            return setPlaceholders.invoke(papiInstance, player, placeholder);
+            return (String) setPlaceholders.invoke(papiInstance, player, placeholder);
         } catch (Exception e) {
             return null;
         }
