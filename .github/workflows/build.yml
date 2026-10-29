@@ -3,6 +3,7 @@ name: build
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -36,6 +37,7 @@ jobs:
       # Action artifacts live on Azure blob storage, which is unreachable from
       # the deployment network; a release asset is downloadable everywhere.
       - name: Publish release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

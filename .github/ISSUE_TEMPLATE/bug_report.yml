@@ -1,0 +1,24 @@
+name: Bug report
+description: The bridge does not push, poll or link correctly.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Never paste your `token` or the site's `MC_INGEST_TOKEN`."
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Paper and Java version
+      placeholder: Paper 1.21.8 / Java 21
+  - type: textarea
+    id: logs
+    attributes:
+      label: Server log around the failure
+      description: Remove the token and any player data.
+      render: shell
